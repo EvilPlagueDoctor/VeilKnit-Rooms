@@ -1,0 +1,57 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2022-x64",
+      "displayName": "Visual Studio 2022 - x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/vs2022-x64",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "17",
+        "VEILKNIT_BUILD_EXAMPLES": "ON",
+        "VEILKNIT_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "native-debug",
+      "displayName": "Native Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/native-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VEILKNIT_BUILD_EXAMPLES": "ON",
+        "VEILKNIT_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-x64",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "native-debug",
+      "configurePreset": "native-debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "vs2022-x64",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "native-debug",
+      "configurePreset": "native-debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
