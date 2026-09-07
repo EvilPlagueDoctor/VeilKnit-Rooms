@@ -191,12 +191,16 @@ Room room_from_json(const Value& value) {
 
 } // namespace
 
-std::vector<Room> load_rooms(const std::filesystem::path& path) {
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) return {};
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return {};
-    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+std::string serialize_rooms(const std::vector<Room>& rooms) {
+    Value root = Value::make_object();
+    root["version"] = static_cast<std::uint64_t>(1);
+    Value values = Value::make_array();
+    for (const auto& room : rooms) values.push_back(room_to_json(room));
+    root["rooms"] = std::move(values);
+    return root.dump();
+}
+
+std::vector<Room> deserialize_rooms(const std::string& text) {
     const auto root = Value::parse(text);
     std::vector<Room> rooms;
     if (!root.contains("rooms")) return rooms;
@@ -204,19 +208,23 @@ std::vector<Room> load_rooms(const std::filesystem::path& path) {
     return rooms;
 }
 
+std::vector<Room> load_rooms(const std::filesystem::path& path) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) return {};
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return deserialize_rooms(text);
+}
+
 void save_rooms(const std::filesystem::path& path, const std::vector<Room>& rooms) {
-    Value root = Value::make_object();
-    root["version"] = static_cast<std::uint64_t>(1);
-    Value values = Value::make_array();
-    for (const auto& room : rooms) values.push_back(room_to_json(room));
-    root["rooms"] = std::move(values);
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
     const auto temporary = path.string() + ".tmp";
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("could not open room database for writing");
-        output << root.dump();
+        output << serialize_rooms(rooms);
         output.flush();
         if (!output) throw std::runtime_error("could not write room database");
     }

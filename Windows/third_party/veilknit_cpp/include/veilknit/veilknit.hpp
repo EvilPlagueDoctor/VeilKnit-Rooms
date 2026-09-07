@@ -37,6 +37,12 @@ struct Credential {
     void save(const std::filesystem::path& path) const;
 };
 
+struct EndpointInfo {
+    std::uint16_t protocol_version = 0;
+    std::string endpoint;
+    std::string profile_id;
+};
+
 struct ApiInfo {
     std::uint16_t protocol_version = 0;
     std::string authentication_proof;
@@ -63,6 +69,8 @@ struct Session {
 
 struct LocalIdentity {
     std::string username;
+    std::string display_name;
+    std::string profile_id;
     std::string main_dht;
 };
 
@@ -208,8 +216,10 @@ private:
 
 class Client {
 public:
+    static EndpointInfo discover_endpoint_info();
     static std::string discover_endpoint();
     static std::filesystem::path discover_credential_path(const std::string& app_id);
+    static std::filesystem::path preferred_credential_path(const std::string& app_id);
     static Credential load_discovered_credential(const std::string& app_id);
     static ApiInfo api_info(const std::string& endpoint);
     static void ping(const std::string& endpoint);

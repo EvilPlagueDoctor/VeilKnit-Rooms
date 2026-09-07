@@ -50,13 +50,11 @@ data class Credential(
     companion object {
         fun load(file: File): Credential {
             val value = JSONObject(file.readText())
-            val storedProtocol = value.optInt("protocol_version", 1)
-            require(storedProtocol in 1..PROTOCOL_VERSION) {
-                "Credential protocol $storedProtocol is newer than this Rooms build"
+            val storedProtocol = value.optInt("protocol_version", 0)
+            require(storedProtocol == PROTOCOL_VERSION) {
+                "Credential protocol $storedProtocol is not valid for daemon API v$PROTOCOL_VERSION; reauthorization is required"
             }
             return Credential(
-                // v1/v2 files contain the same app secret and generation. The
-                // new client upgrades their wire protocol/auth domain in place.
                 protocolVersion = PROTOCOL_VERSION,
                 endpoint = value.optString("endpoint", "android-binder"),
                 appId = value.getString("app_id"),
@@ -77,7 +75,7 @@ data class Session(
     val capabilities: List<String>,
 )
 
-data class LocalIdentity(val username: String, val mainDht: String)
+data class LocalIdentity(val username: String, val displayName: String, val profileId: String, val mainDht: String)
 data class SigningIdentity(val publicKeyHex: String, val keyGeneration: Long)
 data class SignatureResult(val signatureHex: String, val publicKeyHex: String)
 data class StoreDescriptor(
@@ -100,7 +98,12 @@ class VeilKnitClient private constructor(
     suspend fun identity(): LocalIdentity {
         val result = request("get_identity")
         expectType(result, "identity")
-        return LocalIdentity(result.getString("username"), result.getString("main_dht"))
+        return LocalIdentity(
+            username = result.getString("username"),
+            displayName = result.optString("display_name", result.getString("username")),
+            profileId = result.optString("profile_id"),
+            mainDht = result.getString("main_dht"),
+        )
     }
 
     suspend fun signingIdentity(): SigningIdentity {
@@ -207,6 +210,32 @@ class VeilKnitClient private constructor(
             recordKey = result.getString("record_key"),
             values = parseStoreValues(result.getJSONArray("values")),
         )
+    }
+
+    suspend fun putPrivateValue(key: String, bytes: ByteArray) {
+        val result = request(
+            "put_private_value",
+            JSONObject()
+                .put("key", key)
+                .put("value_base64", Encoding.base64(bytes))
+                .put("retention", "persistent"),
+        )
+        expectType(result, "private_value_stored")
+    }
+
+    suspend fun getPrivateValue(key: String): ByteArray? {
+        val result = request("get_private_value", JSONObject().put("key", key))
+        return when (result.getString("type")) {
+            "private_value_read" -> Encoding.unbase64(result.getString("value_base64"))
+            "private_value_missing" -> null
+            else -> error("Unexpected private storage response: ${result.getString("type")}")
+        }
+    }
+
+    suspend fun deletePrivateValue(key: String): Boolean {
+        val result = request("delete_private_value", JSONObject().put("key", key))
+        expectType(result, "private_value_deleted")
+        return result.optBoolean("deleted")
     }
 
     suspend fun requestRestriction(subject: String, reason: String): Long {

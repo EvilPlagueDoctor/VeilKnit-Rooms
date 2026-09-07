@@ -1,6 +1,7 @@
 package com.veilknit.rooms.data
 
 import android.content.Context
+import android.util.Log
 import com.veilknit.rooms.daemon.Credential
 import com.veilknit.rooms.daemon.DaemonConnector
 import com.veilknit.rooms.daemon.VeilKnitClient
@@ -10,11 +11,14 @@ import com.veilknit.rooms.protocol.makeInviteCode
 import com.veilknit.rooms.protocol.parseInviteCode
 import com.veilknit.rooms.protocol.roomManifestBody
 import com.veilknit.rooms.protocol.signedEnvelope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,27 +37,43 @@ private const val ROOM_STORE_SUBKEYS = 64
 private const val ROOM_MESSAGES_PER_PAGE = 4
 private const val FALLBACK_ROOM_VALUE_LIMIT = 15_872
 private const val MAX_CHAT_UTF8_BYTES = 2_000
+private const val LOG_TAG = "VeilKnitRooms"
 
 class RoomEngine(context: Context) {
     private val appContext = context.applicationContext
     private val repository = RoomRepository(appContext)
     private val connector = DaemonConnector(appContext)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // A launch directly from this application scope is a root coroutine. Without
+    // an exception handler, an exception that has merely been observed with
+    // invokeOnCompletion still reaches Android's uncaught-exception handler and
+    // can terminate the whole process. Room/network operations are expected to
+    // fail occasionally (stale DHT data, an offline owner, a closed Binder
+    // stream, etc.), so contain those failures here and let reportErrors() turn
+    // them into UI state instead of an app crash.
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, error ->
+        if (error !is CancellationException) {
+            Log.e(LOG_TAG, "Contained uncaught Rooms coroutine failure", error)
+        }
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + coroutineExceptionHandler)
     private val lock = Mutex()
     private var client: VeilKnitClient? = null
     private var subscriptionJob: Job? = null
     private var heartbeatJob: Job? = null
+    private var persistenceJob: Job? = null
+    private val persistenceSignal = Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var pendingPersistence: PendingPersistence? = null
+    @Volatile private var activeProfileId: String? = null
 
-    private val initialRooms = repository.loadRooms()
-    private val mutableState = MutableStateFlow(
-        RoomsUiState(
-            rooms = initialRooms,
-            selectedRoomIndex = if (initialRooms.isEmpty()) -1 else 0,
-        ),
-    )
+    // Account-scoped room state is loaded only after the daemon tells us which
+    // local profile is active. This prevents a newly selected daemon account
+    // from seeing or acting on another account's saved room memberships.
+    private val mutableState = MutableStateFlow(RoomsUiState())
     val state: StateFlow<RoomsUiState> = mutableState.asStateFlow()
 
     fun start() {
+        if (persistenceJob == null) persistenceJob = scope.launch { persistenceLoop() }
         connect(resetCredential = false)
         if (heartbeatJob == null) heartbeatJob = scope.launch { heartbeatLoop() }
     }
@@ -76,32 +96,129 @@ class RoomEngine(context: Context) {
         subscriptionJob?.cancel()
         client = null
         connector.disconnect()
-        if (resetCredential) repository.credentialFile.delete()
         connector.connect()
 
-        val credential = if (repository.credentialFile.isFile) {
-            Credential.load(repository.credentialFile)
+        val daemonState = connector.daemonState()
+        require(daemonState.optBoolean("ready")) {
+            daemonState.optString("status").ifBlank { "VeilKnit Daemon is not ready yet" }
+        }
+        val announcedProfileId = daemonState.optString("profile_id").trim()
+        require(announcedProfileId.isNotEmpty()) {
+            "The daemon did not publish an active profile id; update/start the new account-aware daemon first"
+        }
+        val announcedDaemonInstanceId = daemonState.optString("daemon_instance_id").trim()
+        require(announcedDaemonInstanceId.isNotEmpty()) {
+            "The daemon did not publish a daemon instance id; update/start the new account-aware daemon first"
+        }
+        // Do not leave the previous account's room list visible while this
+        // account is authorizing/authenticating. It will be reloaded from the
+        // profile-scoped database after authentication succeeds.
+        activeProfileId = null
+        mutableState.update {
+            it.copy(
+                username = "",
+                mainDht = "",
+                signingKey = "",
+                rooms = emptyList(),
+                selectedRoomIndex = -1,
+                demoMode = false,
+            )
+        }
+        val scopedCredentialFile = repository.credentialFile(announcedProfileId)
+        if (resetCredential) scopedCredentialFile.delete()
+
+        var migratedLegacyState = false
+        val credential: Credential
+        val api: VeilKnitClient
+        if (scopedCredentialFile.isFile) {
+            credential = Credential.load(scopedCredentialFile)
+            api = VeilKnitClient.authenticate(connector, credential)
         } else {
-            mutableState.update { it.copy(connection = ConnectionState.Authorizing, status = "Approve VeilKnit Rooms in the daemon Applications tab", authorizationPending = true) }
-            VeilKnitClient.register(
-                connector = connector,
-                appId = APP_ID,
-                displayName = APP_NAME,
-                onPending = { mutableState.update { it.copy(authorizationPending = true) } },
-            ).also { it.save(repository.credentialFile) }
+            // One-time migration from the pre-account-aware Rooms layout. A
+            // legacy credential is copied only if it authenticates against the
+            // profile that is active right now.
+            val legacyCredential = repository.legacyCredential()
+            val migrated = if (!resetCredential && legacyCredential.isFile) {
+                runCatching {
+                    val candidate = Credential.load(legacyCredential)
+                    candidate to VeilKnitClient.authenticate(connector, candidate)
+                }.getOrNull()
+            } else null
+
+            if (migrated != null) {
+                credential = migrated.first
+                api = migrated.second
+                credential.save(scopedCredentialFile)
+                repository.migrateLegacyRooms(announcedProfileId)
+                migratedLegacyState = true
+            } else {
+                mutableState.update {
+                    it.copy(
+                        connection = ConnectionState.Authorizing,
+                        status = "Approve VeilKnit Rooms in the daemon application prompt",
+                        authorizationPending = true,
+                    )
+                }
+                credential = try {
+                    VeilKnitClient.register(
+                        connector = connector,
+                        appId = APP_ID,
+                        displayName = APP_NAME,
+                        onPending = { mutableState.update { it.copy(authorizationPending = true) } },
+                    )
+                } catch (error: com.veilknit.rooms.daemon.DaemonApiException) {
+                    if (error.code == "app_already_registered") {
+                        throw IllegalStateException(
+                            "VeilKnit Rooms is already registered for this daemon account, but its local credential is missing. " +
+                                "Rotate the veilknit.rooms credential in the daemon Applications page, then reconnect.",
+                            error,
+                        )
+                    }
+                    throw error
+                }
+                credential.save(scopedCredentialFile)
+                api = VeilKnitClient.authenticate(connector, credential)
+            }
         }
 
-        val api = VeilKnitClient.authenticate(connector, credential)
-        // Rewrite older credential-v1.json files using protocol 3 after the
-        // daemon confirms the secret is still valid.
-        credential.save(repository.credentialFile)
         val identity = api.identity()
+        require(identity.profileId.isBlank() || identity.profileId == announcedProfileId) {
+            "Daemon account changed while Rooms was connecting; reconnect to the active account"
+        }
+        val confirmedDaemonState = connector.daemonState()
+        require(
+            confirmedDaemonState.optString("profile_id").trim() == announcedProfileId &&
+                confirmedDaemonState.optString("daemon_instance_id").trim() == announcedDaemonInstanceId
+        ) {
+            "Daemon account or daemon instance changed while Rooms was connecting; reconnect to the active account"
+        }
+        activeProfileId = announcedProfileId
         val signing = api.signingIdentity()
         val ownedStores = api.listStores().associateBy { it.storeId }
         client = api
+
+        var migratedPlaintextState = false
+        val encryptedRooms = repository.loadEncryptedRooms(api)
+        val storedRooms = if (encryptedRooms != null) {
+            repository.deleteLocalRooms(announcedProfileId)
+            if (migratedLegacyState) repository.deleteLegacyRooms()
+            encryptedRooms
+        } else {
+            val hadLocalRooms = repository.hasLocalRooms(announcedProfileId)
+            val localRooms = repository.loadLocalRooms(announcedProfileId)
+            if (hadLocalRooms) {
+                // Only delete the plaintext file after the complete state has
+                // been committed to the daemon-owned encrypted app vault.
+                repository.saveEncryptedRooms(api, localRooms)
+                repository.deleteLocalRooms(announcedProfileId)
+                if (migratedLegacyState) repository.deleteLegacyRooms()
+                migratedPlaintextState = true
+            }
+            localRooms
+        }
         lock.withLock {
             val current = mutableState.value
-            val rooms = current.rooms.map { room ->
+            val rooms = storedRooms.map { room ->
                 val descriptor = ownedStores[room.ownedStoreId]
                 val member = room.members[identity.mainDht] ?: Member(mainDht = identity.mainDht)
                 room.copy(
@@ -110,7 +227,7 @@ class RoomEngine(context: Context) {
                     ownedStoreGeneration = descriptor?.generation ?: room.ownedStoreGeneration,
                     members = room.members + (
                         identity.mainDht to member.copy(
-                            displayName = member.displayName.takeUnless { it == "Unknown" || it.isBlank() } ?: identity.username,
+                            displayName = member.displayName.takeUnless { it == "Unknown" || it.isBlank() } ?: identity.displayName,
                             signingKey = signing.publicKeyHex,
                             online = true,
                             lastSeen = now(),
@@ -120,16 +237,19 @@ class RoomEngine(context: Context) {
             }
             mutableState.value = current.copy(
                 connection = ConnectionState.Connected,
-                status = "Connected as ${identity.username}",
-                username = identity.username,
+                status = "Connected as ${identity.displayName}",
+                username = identity.displayName,
                 mainDht = identity.mainDht,
                 signingKey = signing.publicKeyHex,
                 rooms = rooms,
+                selectedRoomIndex = if (rooms.isEmpty()) -1 else current.selectedRoomIndex.coerceIn(0, rooms.lastIndex),
                 demoMode = false,
                 authorizationPending = false,
             )
             saveRoomsLocked()
         }
+        if (migratedPlaintextState) appendOperation("Migrated plaintext Rooms data into daemon-encrypted private storage")
+        else if (migratedLegacyState) appendOperation("Migrated the legacy Rooms credential into the active daemon account")
         startSubscription(api)
         runCatching { api.triggerMessageRetrieval() }
         mutableState.value.rooms.filterNot(Room::suspended).map(Room::roomId).forEach { syncRoomInternal(it) }
@@ -145,7 +265,7 @@ class RoomEngine(context: Context) {
                         room,
                         "join_request",
                         JSONObject()
-                            .put("display_name", identity.username)
+                            .put("display_name", identity.displayName)
                             .put("signing_key", signing.publicKeyHex),
                         directRecipient = room.ownerMainDht,
                     )
@@ -160,7 +280,16 @@ class RoomEngine(context: Context) {
         subscriptionJob?.cancel()
         subscriptionJob = scope.launch {
             api.subscribeMessages()
-                .catch { error -> setStatus(ConnectionState.Error, "Message stream stopped: ${error.message}") }
+                .catch { error ->
+                    if (activeProfileId != null) {
+                        setStatus(ConnectionState.Connecting, "Daemon connection changed; reconnecting…")
+                        appendOperation("Message stream stopped: ${error.message}")
+                        delay(750)
+                        connect(false)
+                    } else {
+                        setStatus(ConnectionState.Error, "Message stream stopped: ${error.message}")
+                    }
+                }
                 .collect { line ->
                     if (line.optString("stream") != "application_messages") return@collect
                     val event = line.optJSONObject("event") ?: return@collect
@@ -291,12 +420,25 @@ class RoomEngine(context: Context) {
         }
         syncRoomInternal(room.roomId)
         room = roomById(room.roomId) ?: room
-        sendControl(
-            room,
-            "join_request",
-            JSONObject().put("display_name", snapshot.username).put("signing_key", snapshot.signingKey),
-            directRecipient = room.ownerMainDht,
-        )
+        val joinSend = runCatching {
+            sendControl(
+                room,
+                "join_request",
+                JSONObject().put("display_name", snapshot.username).put("signing_key", snapshot.signingKey),
+                directRecipient = room.ownerMainDht,
+            )
+        }
+        if (joinSend.isFailure) {
+            val message = joinSend.exceptionOrNull()?.message ?: "Room owner is currently unreachable"
+            appendOperation(
+                "Joined room locally, but the owner could not be contacted yet — $message. " +
+                    "The room has been kept; use Retry when the owner/network is reachable.",
+            )
+            mutableState.update {
+                it.copy(status = "Room joined locally; owner currently unreachable. Use Retry to send the join request again.")
+            }
+            return@launch
+        }
         appendOperation("Join request sent to ${shortIdentity(room.ownerMainDht)}; waiting for owner acceptance")
     }.reportErrors("Joining room")
 
@@ -1015,7 +1157,35 @@ class RoomEngine(context: Context) {
         )
     }
 
-    private fun saveRoomsLocked() = repository.saveRooms(mutableState.value.rooms)
+    private data class PendingPersistence(
+        val profileId: String,
+        val api: VeilKnitClient,
+        val rooms: List<Room>,
+    )
+
+    private fun saveRoomsLocked() {
+        val profileId = activeProfileId ?: return
+        val api = client ?: return
+        pendingPersistence = PendingPersistence(
+            profileId = profileId,
+            api = api,
+            rooms = mutableState.value.rooms,
+        )
+        persistenceSignal.trySend(Unit)
+    }
+
+    private suspend fun persistenceLoop() {
+        for (ignored in persistenceSignal) {
+            val target = pendingPersistence ?: continue
+            if (target.profileId != activeProfileId || target.api !== client) continue
+            runCatching {
+                repository.saveEncryptedRooms(target.api, target.rooms)
+                repository.deleteLocalRooms(target.profileId)
+            }.onFailure { error ->
+                appendOperation("Could not save encrypted Rooms state — ${error.message}")
+            }
+        }
+    }
 
     private fun setStatus(connection: ConnectionState, text: String) {
         appendOperation(text)
@@ -1072,8 +1242,18 @@ class RoomEngine(context: Context) {
     private fun Job.reportErrors(operation: String? = null): Job = also { job ->
         job.invokeOnCompletion { error ->
             if (operation != null) endOperation(operation, error)
-            if (error != null && error !is kotlinx.coroutines.CancellationException) {
-                setStatus(ConnectionState.Error, error.message ?: "Operation failed")
+            if (error != null && error !is CancellationException) {
+                val message = error.message ?: "Operation failed"
+                Log.e(LOG_TAG, "${operation ?: "Rooms operation"} failed", error)
+
+                // A room operation failing does not necessarily mean the daemon
+                // connection failed. Keep an authenticated session connected so
+                // the user can retry rather than forcing the whole app into the
+                // daemon-error state. Connection/setup failures are handled by
+                // connect(), which explicitly sets ConnectionState.Error.
+                mutableState.update { current ->
+                    current.copy(status = message, busyOperation = null)
+                }
             }
         }
     }

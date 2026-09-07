@@ -59,6 +59,7 @@ private:
     void log(std::string text) const;
     void set_status(ConnectionState state, std::string text);
     void save_locked();
+    void persist_pending_impl();
     Room* find_room_locked(const std::string& room_id);
     const Room* selected_room_locked() const;
     Room* selected_room_locked();
@@ -90,6 +91,11 @@ private:
     AppSnapshot state_;
     std::filesystem::path database_path_;
     std::filesystem::path credential_path_;
+    std::string active_profile_id_;
+    std::vector<Room> pending_persist_rooms_;
+    std::string pending_persist_profile_id_;
+    std::uint64_t persist_revision_ = 0;
+    bool persistence_queued_ = false;
 
     std::unique_ptr<veilknit::Client> client_;
     std::unique_ptr<veilknit::MessageSubscription> subscription_;

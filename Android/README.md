@@ -6,7 +6,7 @@ Native Kotlin/Jetpack Compose port of the desktop VeilKnit Rooms client.
 
 - Discord-style responsive UI for phones, tablets, portrait, and landscape.
 - The red/black VeilKnit palette and shield logo.
-- Protocol-v1 daemon authorization and HMAC-SHA256 authentication.
+- Protocol-v3 daemon authorization and HMAC-SHA256 authentication.
 - Live messages plus mailbox retrieval through the Android daemon.
 - AES-256-GCM encrypted `veilknit.rooms` envelopes compatible with the desktop client.
 - Daemon-held Ed25519 application signatures.
@@ -15,7 +15,7 @@ Native Kotlin/Jetpack Compose port of the desktop VeilKnit Rooms client.
 - Creator, moderator, helper, and member roles.
 - Room-local bans, deletion tombstones, blocked phrases, and reputation lookup.
 - Local `/reconnect`, `/reauthorize`, `/sync`, `/replica`, and `/commands` commands.
-- Local `rooms.json` and protected daemon credential storage in the Rooms app sandbox.
+- Profile-scoped room databases and daemon credentials in the Rooms app sandbox.
 
 ## Required daemon build
 
@@ -59,8 +59,7 @@ app\build\outputs\apk\debug\VeilKnitRooms-debug.apk
 ## Reauthorization
 
 Type `/reauthorize` in the message composer, or use **Reset daemon authorization**
-from the top-right menu. Only `credential-v1.json` is removed; room history and
-memberships remain.
+from the top-right menu. This removes only the credential for the **currently active daemon profile**; room history and memberships remain. The account-aware daemon retains the application registration, so if it reports that `veilknit.rooms` is already registered, select Rooms in the daemon **Applications** page, use **Rotate this app's key**, then reconnect.
 
 ## Release signing
 
@@ -87,5 +86,5 @@ not imported by this baseline.
 
 ## Current daemon compatibility
 
-This copy targets VeilKnit local API protocol 3 and `veilknit/app-auth/v2`. Existing protocol-1/2 app credential files are migrated in place when the daemon still recognizes the approved app secret. If the active daemon username has not approved Rooms, use **Reset daemon authorization** (or `/reauthorize`) and approve **VeilKnit Rooms** in the daemon Applications page.
+This copy targets VeilKnit local API protocol 3 and `veilknit/app-auth/v2`. It reads `profile_id` and `daemon_instance_id` from the Binder state, keeps credentials and room databases separate for each daemon account, and reconnects when the daemon instance/message stream changes. A legacy protocol-3 Rooms credential is migrated only after it authenticates against the active profile. Protocol-1/2 credentials require new API-v3 authorization/credential rotation.
 

@@ -1,5 +1,6 @@
 #include "room_engine.hpp"
 
+#include "crypto.hpp"
 #include "persistence.hpp"
 #include "room_protocol.hpp"
 #include "util.hpp"
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cctype>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
@@ -22,6 +24,8 @@ constexpr const char* app_name = "VeilKnit Rooms";
 constexpr std::uint16_t room_store_subkeys = 64;
 constexpr std::uint32_t room_messages_per_page = 4;
 constexpr std::size_t fallback_room_value_limit = 15'872;
+constexpr std::size_t private_state_chunk_bytes = 192 * 1024;
+constexpr const char* private_state_manifest_key = "rooms/state-v1/manifest";
 
 veilknit::Bytes bytes_of(const std::string& value) { return veilknit::Bytes(value.begin(), value.end()); }
 std::string string_of(const veilknit::Bytes& value) { return std::string(value.begin(), value.end()); }
@@ -52,6 +56,156 @@ std::string safe_room_store_name(const std::string& name, const std::string& id,
     return result;
 }
 
+std::string safe_profile_component(const std::string& profile_id) {
+    std::string result;
+    result.reserve(profile_id.size());
+    for (const unsigned char c : profile_id) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '_';
+        result.push_back(safe ? static_cast<char>(c) : '_');
+    }
+    if (result.empty()) throw std::runtime_error("Daemon profile id is unavailable");
+    return result;
+}
+
+std::filesystem::path profile_room_database(const std::string& profile_id) {
+    return app_data_directory() / "profiles" / safe_profile_component(profile_id) / "rooms-v1.json";
+}
+
+std::string private_state_chunk_key(const std::string& generation, std::size_t index) {
+    return "rooms/state-v1/" + generation + "/" + std::to_string(index);
+}
+
+std::optional<veilknit::Bytes> get_private_value(veilknit::Client& client, const std::string& key) {
+    auto request = veilknit::json::Value::make_object();
+    request["action"] = "get_private_value";
+    request["key"] = key;
+    const auto result = client.raw_request(std::move(request));
+    const auto type = result.at("type").as_string();
+    if (type == "private_value_missing") return std::nullopt;
+    if (type != "private_value_read") {
+        throw std::runtime_error("Unexpected daemon private-storage response: " + type);
+    }
+    return veilknit::base64_decode(result.at("value_base64").as_string());
+}
+
+void put_private_value(veilknit::Client& client, const std::string& key, const veilknit::Bytes& bytes) {
+    auto request = veilknit::json::Value::make_object();
+    request["action"] = "put_private_value";
+    request["key"] = key;
+    request["value_base64"] = veilknit::base64_encode(bytes);
+    request["retention"] = "persistent";
+    const auto result = client.raw_request(std::move(request));
+    const auto type = result.at("type").as_string();
+    if (type != "private_value_stored") {
+        throw std::runtime_error("Unexpected daemon private-storage response: " + type);
+    }
+}
+
+void delete_private_value(veilknit::Client& client, const std::string& key) {
+    auto request = veilknit::json::Value::make_object();
+    request["action"] = "delete_private_value";
+    request["key"] = key;
+    const auto result = client.raw_request(std::move(request));
+    const auto type = result.at("type").as_string();
+    if (type != "private_value_deleted") {
+        throw std::runtime_error("Unexpected daemon private-storage response: " + type);
+    }
+}
+
+struct PrivateStateManifest {
+    std::string generation;
+    std::size_t chunk_count = 0;
+    std::size_t byte_length = 0;
+    std::string sha256_hex;
+};
+
+PrivateStateManifest parse_private_state_manifest(const veilknit::Bytes& bytes) {
+    const auto value = veilknit::json::Value::parse(string_of(bytes));
+    if (!value.contains("version") || value.at("version").as_u64() != 1) {
+        throw std::runtime_error("Unsupported encrypted Rooms state version");
+    }
+    PrivateStateManifest manifest;
+    manifest.generation = value.at("generation").as_string();
+    manifest.chunk_count = static_cast<std::size_t>(value.at("chunk_count").as_u64());
+    manifest.byte_length = static_cast<std::size_t>(value.at("byte_length").as_u64());
+    manifest.sha256_hex = value.at("sha256").as_string();
+    if (manifest.generation.empty() || manifest.chunk_count == 0) {
+        throw std::runtime_error("Encrypted Rooms state manifest is incomplete");
+    }
+    return manifest;
+}
+
+veilknit::Bytes make_private_state_manifest(
+    const std::string& generation,
+    std::size_t chunk_count,
+    const veilknit::Bytes& bytes) {
+    auto value = veilknit::json::Value::make_object();
+    value["version"] = static_cast<std::uint64_t>(1);
+    value["generation"] = generation;
+    value["chunk_count"] = static_cast<std::uint64_t>(chunk_count);
+    value["byte_length"] = static_cast<std::uint64_t>(bytes.size());
+    value["sha256"] = bytes_to_hex(sha256(bytes));
+    return bytes_of(value.dump());
+}
+
+std::optional<std::vector<Room>> load_encrypted_rooms(veilknit::Client& client) {
+    const auto manifest_bytes = get_private_value(client, private_state_manifest_key);
+    if (!manifest_bytes) return std::nullopt;
+    const auto manifest = parse_private_state_manifest(*manifest_bytes);
+    veilknit::Bytes joined;
+    joined.reserve(manifest.byte_length);
+    for (std::size_t index = 0; index < manifest.chunk_count; ++index) {
+        const auto chunk = get_private_value(client, private_state_chunk_key(manifest.generation, index));
+        if (!chunk) throw std::runtime_error("Encrypted Rooms state is missing a data chunk");
+        joined.insert(joined.end(), chunk->begin(), chunk->end());
+    }
+    if (joined.size() != manifest.byte_length) {
+        throw std::runtime_error("Encrypted Rooms state length does not match its manifest");
+    }
+    if (bytes_to_hex(sha256(joined)) != manifest.sha256_hex) {
+        throw std::runtime_error("Encrypted Rooms state failed its integrity check");
+    }
+    return deserialize_rooms(string_of(joined));
+}
+
+void save_encrypted_rooms(veilknit::Client& client, const std::vector<Room>& rooms) {
+    std::optional<PrivateStateManifest> previous;
+    if (const auto old_manifest = get_private_value(client, private_state_manifest_key)) {
+        previous = parse_private_state_manifest(*old_manifest);
+    }
+
+    const auto serialized = serialize_rooms(rooms);
+    const veilknit::Bytes bytes(serialized.begin(), serialized.end());
+    const auto generation = random_hex(16);
+    const std::size_t chunk_count = std::max<std::size_t>(1, (bytes.size() + private_state_chunk_bytes - 1) / private_state_chunk_bytes);
+
+    std::size_t written = 0;
+    try {
+        for (std::size_t index = 0; index < chunk_count; ++index) {
+            const auto begin = std::min(index * private_state_chunk_bytes, bytes.size());
+            const auto end = std::min(begin + private_state_chunk_bytes, bytes.size());
+            veilknit::Bytes chunk(bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+                                  bytes.begin() + static_cast<std::ptrdiff_t>(end));
+            put_private_value(client, private_state_chunk_key(generation, index), chunk);
+            ++written;
+        }
+        put_private_value(client, private_state_manifest_key,
+                          make_private_state_manifest(generation, chunk_count, bytes));
+    } catch (...) {
+        for (std::size_t index = 0; index < written; ++index) {
+            try { delete_private_value(client, private_state_chunk_key(generation, index)); } catch (...) {}
+        }
+        throw;
+    }
+
+    if (previous && previous->generation != generation) {
+        for (std::size_t index = 0; index < previous->chunk_count; ++index) {
+            try { delete_private_value(client, private_state_chunk_key(previous->generation, index)); } catch (...) {}
+        }
+    }
+}
+
 } // namespace
 
 RoomEngine::RoomEngine(Notify notify, Log log)
@@ -59,12 +213,23 @@ RoomEngine::RoomEngine(Notify notify, Log log)
       log_(std::move(log)),
       database_path_(app_data_directory() / "rooms-v1.json"),
       credential_path_(app_data_directory() / "credential-v1.json") {
+    // Room state now lives in the daemon-owned encrypted per-app vault.  Do
+    // not expose a plaintext database before authentication.  The old files
+    // are inspected only during the one-time migration after the daemon has
+    // confirmed which profile owns them.
     try {
-        state_.rooms = load_rooms(database_path_);
-        if (!state_.rooms.empty()) state_.selected_room = 0;
+        const auto info = veilknit::Client::discover_endpoint_info();
+        if (!info.profile_id.empty()) {
+            active_profile_id_ = info.profile_id;
+            database_path_ = profile_room_database(info.profile_id);
+        }
+    } catch (const veilknit::Error&) {
+        // No daemon discovery file yet: keep an empty account-neutral view.
     } catch (const std::exception& error) {
-        state_.status = std::string("Room database warning: ") + error.what();
+        state_.status = std::string("Rooms startup warning: ") + error.what();
     }
+    state_.rooms.clear();
+    state_.selected_room = -1;
 }
 
 RoomEngine::~RoomEngine() { stop(); }
@@ -88,7 +253,6 @@ void RoomEngine::stop() {
     if (subscription_thread_.joinable()) subscription_thread_.join();
     if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
     std::lock_guard lock(mutex_);
-    try { save_locked(); } catch (...) {}
     started_ = false;
 }
 
@@ -113,7 +277,59 @@ void RoomEngine::set_status(ConnectionState state, std::string text) {
     notify();
 }
 
-void RoomEngine::save_locked() { save_rooms(database_path_, state_.rooms); }
+void RoomEngine::save_locked() {
+    if (state_.demo_mode || !client_ || active_profile_id_.empty()) return;
+    pending_persist_rooms_ = state_.rooms;
+    pending_persist_profile_id_ = active_profile_id_;
+    ++persist_revision_;
+    if (persistence_queued_ || stopping_) return;
+    persistence_queued_ = true;
+    operations_.push_back([this] { persist_pending_impl(); });
+    operation_cv_.notify_one();
+}
+
+void RoomEngine::persist_pending_impl() {
+    for (;;) {
+        std::vector<Room> rooms;
+        std::string profile_id;
+        std::uint64_t revision = 0;
+        veilknit::Client* client = nullptr;
+        {
+            std::lock_guard lock(mutex_);
+            if (!client_ || pending_persist_profile_id_.empty() ||
+                pending_persist_profile_id_ != active_profile_id_) {
+                persistence_queued_ = false;
+                return;
+            }
+            rooms = pending_persist_rooms_;
+            profile_id = pending_persist_profile_id_;
+            revision = persist_revision_;
+            client = client_.get();
+        }
+
+        try {
+            save_encrypted_rooms(*client, rooms);
+            std::error_code error;
+            const auto plaintext = profile_room_database(profile_id);
+            std::filesystem::remove(plaintext, error);
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard lock(mutex_);
+                persistence_queued_ = false;
+            }
+            log(std::string("Could not save encrypted Rooms state: ") + error.what());
+            return;
+        }
+
+        std::lock_guard lock(mutex_);
+        if (revision == persist_revision_ || pending_persist_profile_id_ != active_profile_id_) {
+            persistence_queued_ = false;
+            return;
+        }
+        // State changed while the previous encrypted snapshot was being
+        // written. Loop immediately and commit the newest coalesced snapshot.
+    }
+}
 
 void RoomEngine::enqueue(std::function<void()> operation) {
     {
@@ -165,7 +381,16 @@ void RoomEngine::reconnect_impl(bool reset_credential) {
 
     if (reset_credential) {
         std::error_code error;
-        const bool removed = std::filesystem::remove(credential_path_, error);
+        bool removed = false;
+        try {
+            credential_path_ = veilknit::Client::preferred_credential_path(app_id);
+            removed = std::filesystem::remove(credential_path_, error) || removed;
+        } catch (const veilknit::Error&) {
+            // Fall through to the legacy Rooms credential below.
+        }
+        const auto legacy = app_data_directory() / "credential-v1.json";
+        error.clear();
+        removed = std::filesystem::remove(legacy, error) || removed;
         if (error) {
             std::lock_guard lock(mutex_);
             reconnecting_ = false;
@@ -188,39 +413,154 @@ void RoomEngine::reconnect_impl(bool reset_credential) {
 }
 
 void RoomEngine::connect_impl() {
-    const auto endpoint = veilknit::Client::discover_endpoint();
-    veilknit::Client::ping(endpoint);
-    veilknit::Credential credential;
-    std::error_code error;
-    if (std::filesystem::is_regular_file(credential_path_, error)) {
-        credential = veilknit::Credential::load(credential_path_);
-        // The daemon endpoint is username-specific. Always follow the current
-        // discovery file so an upgraded daemon or a freshly selected account
-        // does not leave Rooms trying to open an obsolete named pipe.
-        credential.endpoint = endpoint;
-        credential.protocol_version = veilknit::protocol_version;
-        credential.save(credential_path_);
-    } else {
-        set_status(ConnectionState::authorizing, "Approve ‘VeilKnit Rooms’ in the daemon console...");
-        credential = veilknit::Client::register_app(endpoint, app_id, app_name);
-        credential.save(credential_path_);
+    const auto endpoint_info = veilknit::Client::discover_endpoint_info();
+    if (endpoint_info.profile_id.empty()) {
+        throw std::runtime_error(
+            "The daemon endpoint does not include profile_id. Start/update the new account-aware VeilKnit daemon first.");
     }
-    auto client = veilknit::Client::authenticate(credential);
+    const auto& endpoint = endpoint_info.endpoint;
+    veilknit::Client::ping(endpoint);
+
+    const auto scoped_database = profile_room_database(endpoint_info.profile_id);
+    const auto legacy_database = app_data_directory() / "rooms-v1.json";
+    const auto legacy_rooms_credential = app_data_directory() / "credential-v1.json";
+    const auto preferred_credential = veilknit::Client::preferred_credential_path(app_id);
+
+    // Clear the previous account from the visible state while this account is
+    // authenticating. Its state remains safely stored in its profile database.
+    {
+        std::lock_guard lock(mutex_);
+        state_.rooms.clear();
+        state_.selected_room = -1;
+        state_.username.clear();
+        state_.main_dht.clear();
+        state_.signing_key.clear();
+    }
+
+    veilknit::Credential credential;
+    std::unique_ptr<veilknit::Client> connected;
+    bool legacy_credential_authenticated = false;
+
+    auto try_credential = [&](const std::filesystem::path& path, bool legacy_rooms_path) -> bool {
+        std::error_code exists_error;
+        if (!std::filesystem::is_regular_file(path, exists_error)) return false;
+        try {
+            auto candidate = veilknit::Credential::load(path);
+            // Endpoints are per daemon run/account. The credential identifies
+            // the app; discovery identifies where the active daemon lives.
+            candidate.endpoint = endpoint;
+            auto candidate_client = veilknit::Client::authenticate(candidate);
+            credential = std::move(candidate);
+            connected = std::make_unique<veilknit::Client>(std::move(candidate_client));
+            legacy_credential_authenticated = legacy_rooms_path;
+            return true;
+        } catch (const veilknit::Error& error) {
+            log("Ignored unusable Rooms credential " + path.string() + " [" + error.code() + "]: " + error.what());
+            return false;
+        }
+    };
+
+    // First follow the account-aware credential locations published by the
+    // daemon SDK. This also makes daemon-side credential rotation recoverable
+    // on Windows/Linux because app-rotate writes the new credential there.
+    try {
+        const auto discovered = veilknit::Client::discover_credential_path(app_id);
+        const bool is_legacy = discovered != preferred_credential;
+        try_credential(discovered, is_legacy);
+    } catch (const veilknit::Error& error) {
+        if (error.code() != "credential_not_found") throw;
+    }
+
+    // One-time migration from Rooms' old private credential-v1.json location.
+    if (!connected && legacy_rooms_credential != preferred_credential) {
+        try_credential(legacy_rooms_credential, true);
+    }
+
+    if (!connected) {
+        set_status(ConnectionState::authorizing, "Approve ‘VeilKnit Rooms’ in the daemon application prompt...");
+        try {
+            credential = veilknit::Client::register_app(endpoint, app_id, app_name);
+        } catch (const veilknit::Error& error) {
+            if (error.code() == "app_already_registered") {
+                throw std::runtime_error(
+                    "VeilKnit Rooms is already registered for this daemon account, but its credential is missing. "
+                    "Rotate veilknit.rooms in the daemon Applications page, then reconnect.");
+            }
+            throw;
+        }
+        credential.endpoint = endpoint;
+        credential.save(preferred_credential);
+        connected = std::make_unique<veilknit::Client>(veilknit::Client::authenticate(credential));
+    }
+
+    auto& client = *connected;
     const auto identity = client.identity();
+    if (!identity.profile_id.empty() && identity.profile_id != endpoint_info.profile_id) {
+        throw std::runtime_error("Daemon account changed while Rooms was connecting; reconnect to the active account.");
+    }
+
+    // Any credential that successfully authenticated can now be safely copied
+    // into the account-scoped SDK location.
+    credential.endpoint = endpoint;
+    credential.save(preferred_credential);
+    credential_path_ = preferred_credential;
+
+    database_path_ = scoped_database;
+    active_profile_id_ = endpoint_info.profile_id;
+    std::vector<Room> profile_rooms;
+    if (auto encrypted_rooms = load_encrypted_rooms(client)) {
+        profile_rooms = std::move(*encrypted_rooms);
+        // Encrypted daemon storage is authoritative once it exists. Remove
+        // leftover plaintext files from pre-vault builds.
+        std::error_code cleanup_error;
+        std::filesystem::remove(scoped_database, cleanup_error);
+        if (legacy_credential_authenticated) {
+            cleanup_error.clear();
+            std::filesystem::remove(legacy_database, cleanup_error);
+        }
+    } else {
+        std::error_code file_error;
+        bool found_plaintext = false;
+        if (std::filesystem::is_regular_file(scoped_database, file_error)) {
+            profile_rooms = load_rooms(scoped_database);
+            found_plaintext = true;
+        } else if (legacy_credential_authenticated &&
+                   std::filesystem::is_regular_file(legacy_database, file_error)) {
+            profile_rooms = load_rooms(legacy_database);
+            found_plaintext = true;
+        }
+
+        if (found_plaintext) {
+            // Commit the complete old database to the daemon's account/app
+            // scoped encrypted vault before deleting either plaintext copy.
+            save_encrypted_rooms(client, profile_rooms);
+            std::error_code cleanup_error;
+            std::filesystem::remove(scoped_database, cleanup_error);
+            if (legacy_credential_authenticated) {
+                cleanup_error.clear();
+                std::filesystem::remove(legacy_database, cleanup_error);
+            }
+            log("Migrated plaintext Rooms data into daemon-encrypted storage for profile " +
+                endpoint_info.profile_id);
+        }
+    }
+
     const auto signing = client.signing_identity();
     const auto owned_stores = client.list_stores();
     auto subscription = client.subscribe_messages();
 
     {
         std::lock_guard lock(mutex_);
-        client_ = std::make_unique<veilknit::Client>(std::move(client));
+        state_.rooms = std::move(profile_rooms);
+        state_.selected_room = state_.rooms.empty() ? -1 : 0;
+        client_ = std::move(connected);
         subscription_ = std::make_unique<veilknit::MessageSubscription>(std::move(subscription));
-        state_.username = identity.username;
+        state_.username = identity.display_name.empty() ? identity.username : identity.display_name;
         state_.main_dht = identity.main_dht;
         state_.signing_key = signing.public_key_hex;
         state_.connection = ConnectionState::connected;
         state_.demo_mode = false;
-        state_.status = "Connected as " + identity.username;
+        state_.status = "Connected as " + state_.username;
         for (auto& room : state_.rooms) {
             if (!room.owned_store_id.empty()) {
                 const auto found = std::find_if(owned_stores.begin(), owned_stores.end(), [&](const veilknit::StoreDescriptor& store) {
@@ -232,10 +572,6 @@ void RoomEngine::connect_impl() {
                     room.owned_store_generation = found->generation;
                 }
             }
-            // Early demo builds persisted a fake member into real rooms. It is
-            // not a valid DHT record key and caused a pointless handshake every
-            // heartbeat. Preserve demo-only rooms, but remove the placeholder
-            // from every real room.
             if (room.owner_main_dht != legacy_demo_identity) {
                 room.members.erase(legacy_demo_identity);
                 room.replicas.erase(
@@ -244,58 +580,57 @@ void RoomEngine::connect_impl() {
                     }),
                     room.replicas.end());
             }
-            auto& member = room.members[identity.main_dht];
-            member.main_dht = identity.main_dht;
-            if (member.display_name.empty()) member.display_name = identity.username;
-            member.signing_key = signing.public_key_hex;
+            auto& member = room.members[state_.main_dht];
+            member.main_dht = state_.main_dht;
+            if (member.display_name.empty() || member.display_name == "Unknown") member.display_name = state_.username;
+            member.signing_key = state_.signing_key;
             member.online = true;
             member.last_seen = unix_time();
         }
         save_locked();
     }
-    notify();
 
-    if (!subscription_thread_.joinable()) subscription_thread_ = std::thread([this] { subscription_loop(); });
+    notify();
+    log("Authenticated Rooms against daemon profile " + endpoint_info.profile_id + " as " + identity.main_dht);
+
+    subscription_thread_ = std::thread([this] { subscription_loop(); });
     if (!heartbeat_thread_.joinable()) heartbeat_thread_ = std::thread([this] { heartbeat_loop(); });
-    try { client_->trigger_message_retrieval(); } catch (...) {}
+
+    try { client_->trigger_message_retrieval(); }
+    catch (const std::exception& error) { log(std::string("Message retrieval request failed: ") + error.what()); }
 
     std::vector<std::string> room_ids;
     {
         std::lock_guard lock(mutex_);
+        for (const auto& room : state_.rooms) if (!room.suspended) room_ids.push_back(room.room_id);
+    }
+    for (const auto& room_id : room_ids) {
+        try { sync_room_impl(room_id); }
+        catch (const std::exception& error) { note_room_failure(room_id, error.what()); }
+    }
+
+    // Re-announce joins after reconnect so rooms saved by older client builds
+    // can recover if their original join request was never delivered.
+    std::vector<Room> joins;
+    {
+        std::lock_guard lock(mutex_);
         for (const auto& room : state_.rooms) {
-            if (!room.suspended) room_ids.push_back(room.room_id);
+            if (!room.suspended && room.owner_main_dht != state_.main_dht) joins.push_back(room);
         }
     }
-    for (const auto& room_id : room_ids) sync_room_impl(room_id);
-
-    // A previous join request may have been queued under an older platform-
-    // specific application id and never reached the room owner. Re-announce
-    // membership whenever Rooms reconnects; owners deduplicate known members.
-    for (const auto& room_id : room_ids) {
-        Room room;
-        std::string username;
-        std::string signing_key;
-        std::string main_dht;
-        {
-            std::lock_guard lock(mutex_);
-            auto* current = find_room_locked(room_id);
-            if (!current || current->suspended || current->owner_main_dht == state_.main_dht) continue;
-            room = *current;
-            username = state_.username;
-            signing_key = state_.signing_key;
-            main_dht = state_.main_dht;
-        }
-        veilknit::json::Value body = veilknit::json::Value::make_object();
-        body["display_name"] = username;
-        body["signing_key"] = signing_key;
+    for (auto& room : joins) {
         try {
+            veilknit::json::Value body = veilknit::json::Value::make_object();
+            body["display_name"] = state_.username;
+            body["signing_key"] = state_.signing_key;
             send_control(room, "join_request", body, room.owner_main_dht);
-            log("Re-sent room join request to " + short_identity(room.owner_main_dht));
+            log("Re-sent join request to " + short_identity(room.owner_main_dht));
         } catch (const std::exception& error) {
-            log("Could not re-send room join request: " + std::string(error.what()));
+            log(std::string("Could not re-send join request: ") + error.what());
         }
     }
 }
+
 
 void RoomEngine::start_demo_mode() {
     {
@@ -322,7 +657,8 @@ void RoomEngine::start_demo_mode() {
             state_.rooms.push_back(std::move(room));
             state_.selected_room = 0;
         }
-        save_locked();
+        // Demo state is intentionally ephemeral. Never write the fake demo
+        // identity into an account-scoped room database.
     }
     notify();
 }
@@ -339,16 +675,20 @@ void RoomEngine::subscription_loop() {
                 " (" + std::to_string(incoming.payload.size()) + " bytes)");
             handle_wire_message(string_of(incoming.payload));
         } catch (const std::exception& error) {
-            bool should_notify = false;
+            bool should_reconnect = false;
             {
                 std::lock_guard lock(mutex_);
                 if (!stopping_ && !reconnecting_) {
-                    state_.connection = ConnectionState::error;
-                    state_.status = std::string("Message subscription stopped: ") + error.what();
-                    should_notify = true;
+                    state_.connection = ConnectionState::connecting;
+                    state_.status = "Daemon connection changed; reconnecting...";
+                    should_reconnect = true;
                 }
             }
-            if (should_notify) notify();
+            if (should_reconnect) {
+                log(std::string("Message subscription stopped: ") + error.what());
+                notify();
+                enqueue([this] { reconnect_impl(false); });
+            }
             break;
         }
     }
@@ -653,7 +993,7 @@ void RoomEngine::submit_text(std::string text) {
             if (auto* room = selected_room_locked()) {
                 add_system_message(*room,
                     "Local commands: /reconnect reconnects using the saved daemon credential; "
-                    "/reauthorize removes credential-v1.json and requests fresh approval; "
+                    "/reauthorize forgets the active profile credential (rotate veilknit.rooms in daemon Applications if it is already registered); "
                     "Shift+Enter inserts a new line.");
                 save_locked();
             }

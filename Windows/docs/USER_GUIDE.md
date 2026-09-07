@@ -63,8 +63,8 @@ runtime to stop and publish offline presence.
 
 Commands can be typed into the normal message composer. They are processed locally and are not posted to the room.
 
-- `/reconnect` closes the current API connection and reconnects with the saved credential.
-- `/reauthorize` removes the Rooms credential file and requests fresh approval from the daemon.
+- `/reconnect` closes the current API connection and reconnects with the credential scoped to the active daemon account.
+- `/reauthorize` forgets the credential scoped to the active daemon account. If the daemon still has Rooms registered, rotate `veilknit.rooms` from **Applications** and reconnect.
 - `/commands` shows the currently available local commands in `#room-log`.
 
-Use `/reauthorize` after changing daemon authentication/protocol code or when the daemon says the saved credential is no longer valid. The file removed is `%LOCALAPPDATA%\VeilKnit\Rooms\credential-v1.json`. Room history and room settings are kept.
+Use `/reauthorize` after changing daemon authentication/protocol code or when the daemon says the saved credential is no longer valid. Current credentials follow the daemon SDK layout under `%LOCALAPPDATA%\DaemonNetwork\credentials\<profile_id>\veilknit.rooms.json`; the older `%LOCALAPPDATA%\VeilKnit\Rooms\credential-v1.json` is recognized only as a one-time migration source. Room history/settings are also profile-scoped and are kept.

@@ -321,7 +321,7 @@ fun VeilKnitRoomsApp(viewModel: RoomsViewModel) {
         DialogType.Reauthorize -> AlertDialog(
             onDismissRequest = { dialog = null },
             title = { Text("Request fresh authorization?") },
-            text = { Text("This deletes only the Rooms daemon credential. Room memberships and local history are retained.") },
+            text = { Text("This forgets the Rooms credential for the current daemon account. Room memberships and local history are retained. If the daemon says Rooms is already registered afterward, rotate veilknit.rooms from the daemon Applications page, then reconnect.") },
             confirmButton = {
                 Button(onClick = { viewModel.reconnect(true); dialog = null }, colors = ButtonDefaults.buttonColors(containerColor = VeilRed)) {
                     Text("Reauthorize")

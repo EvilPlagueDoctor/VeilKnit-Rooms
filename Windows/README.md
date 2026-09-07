@@ -85,7 +85,7 @@ cannot be accidentally consumed by the wrong console prompt.
 ## Source layout
 
 - `daemon/` — integrated Rust GUI and network daemon
-- `third_party/veilknit_cpp/` — C++ protocol-v1 SDK
+- `third_party/veilknit_cpp/` — C++ protocol-v3 SDK with account-aware daemon discovery
 - `src/` — room engine, persistence, crypto, and Win32 GUI
 - `tests/` — portable room-core tests
 - `scripts/` — build and assembly scripts
@@ -94,7 +94,7 @@ cannot be accidentally consumed by the wrong console prompt.
 
 ## Local connection commands
 
-Type `/reconnect` in the message box to reconnect to the daemon with the current credential. Type `/reauthorize` to remove the saved Rooms credential and request fresh approval. `/commands` displays the command summary.
+Type `/reconnect` in the message box to reconnect to the daemon with the credential belonging to the active daemon profile. Type `/reauthorize` to forget that profile's saved Rooms credential; if the daemon still has `veilknit.rooms` registered, rotate its key in the daemon **Applications** page and reconnect. `/commands` displays the command summary.
 
 
 ## 0.1.0 room storage
@@ -110,7 +110,7 @@ a full store reports a clear capacity error.
 
 ## Current daemon compatibility
 
-This copy targets VeilKnit local API protocol 3 and `veilknit/app-auth/v2`. Existing protocol-1/2 app credential files are migrated in place when the daemon still recognizes the approved app secret. If the active daemon username has not approved Rooms, use **Reset daemon authorization** (or `/reauthorize`) and approve **VeilKnit Rooms** in the daemon Applications page.
+This copy targets VeilKnit local API protocol 3 and `veilknit/app-auth/v2`. Endpoint discovery reads the daemon `profile_id`; credentials are searched/saved under the daemon SDK's profile-scoped credential layout, and Rooms data is stored separately for each daemon profile. Legacy protocol-3 credentials and room data are migrated only after successful authentication against the active profile. Protocol-1/2 credentials require fresh API-v3 authorization/rotation.
 
 
 

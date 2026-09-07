@@ -557,16 +557,11 @@ Credential Credential::load(const std::filesystem::path& path) {
     credential.display_name = value.at("display_name").as_string();
     credential.secret_hex = value.at("secret_hex").as_string();
     credential.credential_generation = value.at("credential_generation").as_u64();
-    // Protocol 1 and 2 credential files contain the same app id, secret, and
-    // generation fields. The wire envelope/authentication domain changed, but
-    // the approved secret itself remains valid, so migrate the local file in
-    // memory rather than forcing the user to re-authorize after an upgrade.
-    if (credential.protocol_version == 0 || credential.protocol_version > veilknit::protocol_version) {
-        fail("credential_protocol_mismatch", "credential uses unsupported protocol " +
-             std::to_string(credential.protocol_version) + ", SDK uses protocol " +
-             std::to_string(veilknit::protocol_version));
+    if (credential.protocol_version != veilknit::protocol_version) {
+        fail("credential_protocol_mismatch", "credential targets protocol " +
+             std::to_string(credential.protocol_version) + ", SDK requires protocol " +
+             std::to_string(veilknit::protocol_version) + "; reauthorization is required");
     }
-    credential.protocol_version = veilknit::protocol_version;
     if (hex_decode(credential.secret_hex).size() != 32) fail("invalid_credential", "credential secret must be 32 bytes");
     return credential;
 }
@@ -628,9 +623,8 @@ void MessageSubscription::close() {
     if (impl_) { impl_->connection.close(); impl_->closed = true; }
 }
 
-std::string Client::discover_endpoint() {
+EndpointInfo Client::discover_endpoint_info() {
     const auto environment = getenv_string("DAEMON_NETWORK_ENDPOINT");
-    if (!environment.empty()) return environment;
     std::vector<std::filesystem::path> paths = {
         std::filesystem::path("app_credentials") / "daemon_endpoint.json",
         executable_directory() / "app_credentials" / "daemon_endpoint.json"
@@ -639,30 +633,98 @@ std::string Client::discover_endpoint() {
     if (!local.empty()) paths.push_back(std::filesystem::path(local) / "DaemonNetwork" / "daemon_endpoint.json");
     const auto home = getenv_string("HOME");
     if (!home.empty()) paths.push_back(std::filesystem::path(home) / ".daemon_network" / "daemon_endpoint.json");
+
     for (const auto& path : unique_paths(std::move(paths))) {
         std::error_code error;
         if (!std::filesystem::is_regular_file(path, error)) continue;
         try {
             const auto value = json::Value::parse(read_text(path));
-            if (value.at("protocol_version").as_u64() == protocol_version) return value.at("endpoint").as_string();
+            if (value.at("protocol_version").as_u64() != protocol_version) continue;
+            const auto endpoint = value.at("endpoint").as_string();
+            if (endpoint.empty()) continue;
+            if (!environment.empty() && endpoint != environment) continue;
+            EndpointInfo info;
+            info.protocol_version = protocol_version;
+            info.endpoint = endpoint;
+            info.profile_id = optional_string_value(value, "profile_id").value_or("");
+            return info;
         } catch (...) {}
     }
+
+    // The explicit endpoint environment variable predates profile-aware
+    // discovery. Preserve it as an unscoped fallback when no matching
+    // discovery file exists.
+    if (!environment.empty()) return EndpointInfo{protocol_version, environment, {}};
     fail("endpoint_not_found", "could not find the VeilKnit daemon endpoint");
 }
 
-std::filesystem::path Client::discover_credential_path(const std::string& app_id) {
+std::string Client::discover_endpoint() {
+    return discover_endpoint_info().endpoint;
+}
+
+std::filesystem::path Client::preferred_credential_path(const std::string& app_id) {
+    const auto info = discover_endpoint_info();
     const auto filename = safe_app_id(app_id) + ".json";
-    std::vector<std::filesystem::path> paths;
-    const auto explicit_file = getenv_string("DAEMON_NETWORK_CREDENTIAL");
-    if (!explicit_file.empty()) paths.emplace_back(explicit_file);
+    const auto profile = safe_app_id(info.profile_id);
     const auto explicit_directory = getenv_string("DAEMON_NETWORK_CREDENTIAL_DIR");
-    if (!explicit_directory.empty()) paths.push_back(std::filesystem::path(explicit_directory) / filename);
-    paths.push_back(std::filesystem::path("app_credentials") / filename);
-    paths.push_back(executable_directory() / "app_credentials" / filename);
+    if (!explicit_directory.empty()) {
+        return info.profile_id.empty()
+            ? std::filesystem::path(explicit_directory) / filename
+            : std::filesystem::path(explicit_directory) / profile / filename;
+    }
     const auto local = getenv_string("LOCALAPPDATA");
-    if (!local.empty()) paths.push_back(std::filesystem::path(local) / "DaemonNetwork" / "credentials" / filename);
+    if (!local.empty()) {
+        auto base = std::filesystem::path(local) / "DaemonNetwork" / "credentials";
+        return info.profile_id.empty() ? base / filename : base / profile / filename;
+    }
     const auto home = getenv_string("HOME");
-    if (!home.empty()) paths.push_back(std::filesystem::path(home) / ".daemon_network" / "credentials" / filename);
+    if (!home.empty()) {
+        auto base = std::filesystem::path(home) / ".daemon_network" / "credentials";
+        return info.profile_id.empty() ? base / filename : base / profile / filename;
+    }
+    return info.profile_id.empty()
+        ? std::filesystem::path("app_credentials") / filename
+        : std::filesystem::path("app_credentials") / profile / filename;
+}
+
+std::filesystem::path Client::discover_credential_path(const std::string& app_id) {
+    const auto info = discover_endpoint_info();
+    const auto filename = safe_app_id(app_id) + ".json";
+    const auto profile = safe_app_id(info.profile_id);
+    std::vector<std::filesystem::path> profile_paths;
+    std::vector<std::filesystem::path> legacy_paths;
+
+    const auto explicit_file = getenv_string("DAEMON_NETWORK_CREDENTIAL");
+    if (!explicit_file.empty()) profile_paths.emplace_back(explicit_file);
+    const auto explicit_directory = getenv_string("DAEMON_NETWORK_CREDENTIAL_DIR");
+    if (!explicit_directory.empty()) {
+        if (!info.profile_id.empty()) profile_paths.push_back(std::filesystem::path(explicit_directory) / profile / filename);
+        legacy_paths.push_back(std::filesystem::path(explicit_directory) / filename);
+    }
+
+    if (!info.profile_id.empty()) {
+        profile_paths.push_back(std::filesystem::path("app_credentials") / profile / filename);
+        profile_paths.push_back(executable_directory() / "app_credentials" / profile / filename);
+    }
+    legacy_paths.push_back(std::filesystem::path("app_credentials") / filename);
+    legacy_paths.push_back(executable_directory() / "app_credentials" / filename);
+
+    const auto local = getenv_string("LOCALAPPDATA");
+    if (!local.empty()) {
+        const auto base = std::filesystem::path(local) / "DaemonNetwork" / "credentials";
+        if (!info.profile_id.empty()) profile_paths.push_back(base / profile / filename);
+        legacy_paths.push_back(base / filename);
+    }
+    const auto home = getenv_string("HOME");
+    if (!home.empty()) {
+        const auto base = std::filesystem::path(home) / ".daemon_network" / "credentials";
+        if (!info.profile_id.empty()) profile_paths.push_back(base / profile / filename);
+        legacy_paths.push_back(base / filename);
+    }
+
+    auto paths = unique_paths(std::move(profile_paths));
+    const auto legacy = unique_paths(std::move(legacy_paths));
+    paths.insert(paths.end(), legacy.begin(), legacy.end());
     for (const auto& path : unique_paths(std::move(paths))) {
         std::error_code error;
         if (std::filesystem::is_regular_file(path, error)) return path;
@@ -795,7 +857,12 @@ json::Value Client::raw_request(json::Value request) const {
 LocalIdentity Client::identity() const {
     auto request = json::Value::make_object(); request["action"] = "get_identity";
     const auto result = expect_type(raw_request(std::move(request)), "identity");
-    return {result.at("username").as_string(), result.at("main_dht").as_string()};
+    LocalIdentity identity;
+    identity.username = result.at("username").as_string();
+    identity.display_name = optional_string_value(result, "display_name").value_or(identity.username);
+    identity.profile_id = optional_string_value(result, "profile_id").value_or("");
+    identity.main_dht = result.at("main_dht").as_string();
+    return identity;
 }
 
 json::Value Client::network_status() const {
